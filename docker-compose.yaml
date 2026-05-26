@@ -1,0 +1,30 @@
+version: '3.8'
+services:
+  postgres-db:
+    image: mirror2.chabokan.net/postgres:15-alpine
+    container_name: internal_db
+    environment:
+      - POSTGRES_USER=set user
+      - POSTGRES_PASSWORD=set password
+      - POSTGRES_DB=sync_storage
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: always
+
+  sync-script:
+    build: .
+    container_name: rahkaran_ad_sync
+    ports:
+      - "80:8080"
+    environment:
+      - PG_CONN_STR=postgresql://your user:your password@postgres-db:5432/sync_storage
+      - SQL_CONN_STR=DRIVER={ODBC Driver 18 for SQL Server};SERVER=Your IP Address;DATABASE=your database name;UID=user dabase;PWD=pass user;TrustServerCertificate=yes;
+      - LDAP_SERVER=ldap://Your LDAP SERVER:389
+      - LDAP_USER=Your Domain LDAP\USER Domain
+      - LDAP_PASSWORD=Your Pass user ldap
+    volumes:
+      - .:/opt/digiexpress-sync
+    restart: always
+
+volumes:
+  pgdata:
