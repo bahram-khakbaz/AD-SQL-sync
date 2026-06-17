@@ -1,5 +1,4 @@
 import os
-import sys
 import logging
 import time
 import threading
@@ -7,13 +6,14 @@ from datetime import datetime, timedelta
 import psycopg2
 import pyodbc
 from ldap3 import Server, Connection, ALL, MODIFY_REPLACE
+from ldap3.utils.conv import escape_filter_chars
 from flask import Flask, jsonify, render_template_string, send_from_directory
 
 # --- تنظیمات لاگین برای مانیتورینگ در داکر ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- راه‌اندازی Flask برای مانیتورینگ آنلاین پنل وب ---
+# --- راهاندازی Flask برای مانیتورینگ آنلاین پنل وب ---
 app = Flask(__name__)
 sync_status = {
     "status": "Initializing",
@@ -22,18 +22,19 @@ sync_status = {
     "skipped_count": 0,
     "next_sync_eta": "Calculating...",
     "errors": [],
-    "changes_log": [], # اضافه کردن لیست تغییرات اخیر
-    "errors": []       # لیست خطاها
+    "changes_log": []  # لیست تغییرات اخیر
 }
 
 # --- بارگذاری متغیرهای محیطی از داکرکومپوز ---
-PG_CONN_STR = os.getenv("PG_CONN_STR", "postgresql://your user:your password@postgres-db:5432/sync_storage")
+PG_CONN_STR = os.getenv("PG_CONN_STR", "postgresql://admin:MySecretPostgresPass123@postgres-db:5432/sync_storage")
 SQL_CONN_STR = os.getenv("SQL_CONN_STR")
 
-AD_SERVER = os.getenv("LDAP_SERVER", "ldap://Your Ldap Server")
+AD_SERVER = os.getenv("LDAP_SERVER", "ldap://DN2-DC01.digikala.com")
 AD_USER = os.getenv("LDAP_USER")
 AD_PASSWORD = os.getenv("LDAP_PASSWORD")
-AD_SEARCH_BASE = os.getenv("AD_SEARCH_BASE", "DC=your domain,DC=com")
+AD_SEARCH_BASE = os.getenv("AD_SEARCH_BASE", "DC=digikala,DC=com")
+COMPANY_VALUE = os.getenv("AD_COMPANY_VALUE", "Digi Express")
+RESET_SYNC_CACHE_ON_START = os.getenv("RESET_SYNC_CACHE_ON_START", "false").strip().lower() in ("1", "true", "yes", "y")
 
 # --- قالب گرافیکی HTML داشبورد مانیتورینگ ---
 DASHBOARD_HTML = """
@@ -45,7 +46,7 @@ DASHBOARD_HTML = """
     <link href="/static/bootstrap.rtl.min.css" rel="stylesheet">
     <link rel="stylesheet" href="/static/all.min.css">
     <style>
-        /* لود فونت‌های دانلود شده از لوکال */
+        /* لود فونتهای دانلود شده از لوکال */
         @font-face {
             font-family: 'Orbitron';
             src: url('/static/Orbitron-Regular.ttf') format('truetype');
@@ -195,14 +196,16 @@ def get_rahkaran_data():
         raise e
 
 def find_ad_user_by_email(ad_conn, email):
-    search_filter = f"(|(mail={email})(userPrincipalName={email}))"
+    safe_email = escape_filter_chars(email)
+    search_filter = f"(|(mail={safe_email})(userPrincipalName={safe_email}))"
     ad_conn.search(
         search_base=AD_SEARCH_BASE,
         search_filter=search_filter,
         attributes=[
             'distinguishedName', 'employeeID', 'contractType',
             'costCenterDlTitle', 'empMob', 'extensionAttribute7',
-            'department', 'title', 'manager', 'faDisplayName'
+            'department', 'title', 'manager', 'faDisplayName',
+            'company'
         ]
     )
     if ad_conn.entries:
@@ -212,15 +215,28 @@ def find_ad_user_by_email(ad_conn, email):
 def find_ad_manager_dn_by_email(ad_conn, manager_email):
     if not manager_email:
         return None
-    search_filter = f"(|(mail={manager_email})(userPrincipalName={manager_email}))"
+    safe_email = escape_filter_chars(manager_email)
+    search_filter = f"(|(mail={safe_email})(userPrincipalName={safe_email}))"
     ad_conn.search(search_base=AD_SEARCH_BASE, search_filter=search_filter, attributes=['distinguishedName'])
     if ad_conn.entries:
         return str(ad_conn.entries[0].distinguishedName)
     return None
 
-def main_loop():
+def main_loop(rebuild_cache=False):
+    """
+    rebuild_cache=True:
+        - sync_cache را خالی میکند.
+        - برای همه رکوردهای راهکاران با AD چک میکند.
+        - اگر لازم بود AD را آپدیت میکند.
+        - بعد از موفقیت، cache را از نو میسازد.
+
+    rebuild_cache=False:
+        - اول فقط راهکاران را با sync_cache مقایسه میکند.
+        - اگر داده نسبت به cache تغییری نکرده باشد، اصلاً به AD وصل نمیشود.
+        - فقط برای رکوردهای جدید/تغییرکرده به AD وصل میشود و آپدیت میزند.
+    """
     global sync_status
-    logger.info("Starting synchronization cycle...")
+    logger.info("Starting synchronization cycle... rebuild_cache=%s", rebuild_cache)
 
     try:
         employees = get_rahkaran_data()
@@ -232,16 +248,6 @@ def main_loop():
     if not employees:
         logger.warning("No data found from Rahkaran. Skipping this cycle.")
         sync_status["status"] = "Skipped (No Data)"
-        return
-
-    try:
-        server = Server(AD_SERVER, get_info=ALL)
-        ad_conn = Connection(server, user=AD_USER, password=AD_PASSWORD, auto_bind=True)
-        logger.info("Connected successfully to Active Directory.")
-    except Exception as e:
-        logger.error(f"LDAP connection failed: {e}")
-        sync_status["status"] = "Failed (AD LDAP Connection Error)"
-        sync_status["errors"].append(f"AD Connection Error: {str(e)}")
         return
 
     try:
@@ -257,17 +263,80 @@ def main_loop():
                 ext_attribute7 VARCHAR(100),
                 department VARCHAR(255),
                 job_title VARCHAR(255),
+                manager_email VARCHAR(255),
                 manager_dn TEXT,
-                fa_display_name VARCHAR(255)
+                fa_display_name VARCHAR(255),
+                company VARCHAR(255)
             )
         """)
+        # برای سازگاری با جدول قبلی که manager_email نداشت
+        pg_cursor.execute("ALTER TABLE sync_cache ADD COLUMN IF NOT EXISTS manager_email VARCHAR(255)")
         pg_conn.commit()
+
+        if rebuild_cache:
+            logger.warning("Initial rebuild requested. Truncating sync_cache before AD validation...")
+            pg_cursor.execute("TRUNCATE TABLE sync_cache")
+            pg_conn.commit()
     except Exception as e:
         logger.error(f"PostgreSQL connection/init failed: {e}")
-        ad_conn.unbind()
         sync_status["status"] = "Failed (Local DB Cache Error)"
         sync_status["errors"].append(f"DB Error: {str(e)}")
         return
+
+    ad_conn = None
+
+    def ensure_ad_connection():
+        nonlocal ad_conn
+        if ad_conn is not None and ad_conn.bound:
+            return ad_conn
+        try:
+            server = Server(AD_SERVER, get_info=ALL)
+            ad_conn = Connection(server, user=AD_USER, password=AD_PASSWORD, auto_bind=True)
+            logger.info("Connected successfully to Active Directory.")
+            return ad_conn
+        except Exception as e:
+            logger.error(f"LDAP connection failed: {e}")
+            raise Exception(f"AD Connection Error: {str(e)}")
+
+    def get_ad_val_safe(user_obj, attr_name):
+        attr = getattr(user_obj, attr_name, None)
+        if attr is None:
+            return ""
+        if hasattr(attr, 'values') and attr.values:
+            return str(attr.values[0]).strip()
+        if hasattr(attr, 'value') and attr.value:
+            if isinstance(attr.value, list):
+                return str(attr.value[0]).strip()
+            return str(attr.value).strip()
+        val_str = str(attr).strip()
+        return "" if val_str.startswith('[') or val_str.endswith(']') else val_str
+
+    def upsert_cache(email, emp_id, contract_type, cost_center, emp_mob, ext_attr7,
+                     department, job_title, manager_email, manager_dn, fa_display_name, company):
+        pg_cursor.execute("""
+            INSERT INTO sync_cache (
+                email, employee_id, contract_type, cost_center_title, emp_mob,
+                ext_attribute7, department, job_title, manager_email, manager_dn,
+                fa_display_name, company
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (email) DO UPDATE SET
+                employee_id=EXCLUDED.employee_id,
+                contract_type=EXCLUDED.contract_type,
+                cost_center_title=EXCLUDED.cost_center_title,
+                emp_mob=EXCLUDED.emp_mob,
+                ext_attribute7=EXCLUDED.ext_attribute7,
+                department=EXCLUDED.department,
+                job_title=EXCLUDED.job_title,
+                manager_email=EXCLUDED.manager_email,
+                manager_dn=EXCLUDED.manager_dn,
+                fa_display_name=EXCLUDED.fa_display_name,
+                company=EXCLUDED.company
+        """, (
+            email, emp_id, contract_type, cost_center, emp_mob, ext_attr7,
+            department, job_title, manager_email, manager_dn, fa_display_name, company
+        ))
+        pg_conn.commit()
 
     updated_count = 0
     skipped_count = 0
@@ -286,37 +355,40 @@ def main_loop():
             first_name = emp['FirstName'].strip() if emp['FirstName'] else ""
             last_name = emp['LastName'].strip() if emp['LastName'] else ""
             fa_display_name = f"{first_name} {last_name}".strip()
+            company = COMPANY_VALUE
 
-            ad_user = find_ad_user_by_email(ad_conn, email)
+            # در سیکلهای عادی، اول با cache مقایسه میکنیم تا بیدلیل به AD فشار نیاید.
+            # manager_dn را اینجا مقایسه نمیکنیم چون برای ساختنش باید AD سرچ شود؛ manager_email را cache کردهایم.
+            if not rebuild_cache:
+                pg_cursor.execute("""
+                    SELECT employee_id, contract_type, cost_center_title, emp_mob,
+                           ext_attribute7, department, job_title, manager_email,
+                           fa_display_name, company
+                    FROM sync_cache
+                    WHERE email = %s
+                """, (email,))
+                cached = pg_cursor.fetchone()
+
+                current_signature = (
+                    emp_id, contract_type, cost_center, emp_mob, ext_attr7,
+                    department, job_title, manager_email, fa_display_name, company
+                )
+
+                if cached and tuple("" if v is None else str(v) for v in cached) == current_signature:
+                    skipped_count += 1
+                    continue
+
+            conn = ensure_ad_connection()
+            ad_user = find_ad_user_by_email(conn, email)
             if not ad_user:
                 skipped_count += 1
+                logger.warning("AD user not found for email: %s", email)
                 continue
 
             user_dn = str(ad_user.distinguishedName)
             manager_dn = ""
             if manager_email:
-                manager_dn = find_ad_manager_dn_by_email(ad_conn, manager_email) or ""
-
-            pg_cursor.execute("SELECT employee_id, contract_type, cost_center_title, emp_mob, ext_attribute7, department, job_title, manager_dn, fa_display_name FROM sync_cache WHERE email = %s", (email,))
-            cached = pg_cursor.fetchone()
-
-            has_changes = False
-            if not cached or (cached[0] != emp_id or cached[1] != contract_type or cached[2] != cost_center or cached[3] != emp_mob or cached[4] != ext_attr7 or cached[5] != department or cached[6] != job_title or cached[7] != manager_dn or cached[8] != fa_display_name):
-                has_changes = True
-
-            if not has_changes:
-                skipped_count += 1
-                continue
-
-            def get_ad_val_safe(user_obj, attr_name):
-                attr = getattr(user_obj, attr_name, None)
-                if attr is None: return ""
-                if hasattr(attr, 'values') and attr.values: return str(attr.values[0]).strip()
-                if hasattr(attr, 'value') and attr.value:
-                    if isinstance(attr.value, list): return str(attr.value[0]).strip()
-                    return str(attr.value).strip()
-                val_str = str(attr).strip()
-                return "" if val_str.startswith('[') or val_str.endswith(']') else val_str
+                manager_dn = find_ad_manager_dn_by_email(conn, manager_email) or ""
 
             ad_emp_id = get_ad_val_safe(ad_user, 'employeeID')
             ad_contract = get_ad_val_safe(ad_user, 'contractType')
@@ -327,6 +399,7 @@ def main_loop():
             ad_title = get_ad_val_safe(ad_user, 'title')
             ad_fa_name = get_ad_val_safe(ad_user, 'faDisplayName')
             ad_manager = get_ad_val_safe(ad_user, 'manager')
+            ad_company = get_ad_val_safe(ad_user, 'company')
 
             changes = {}
             if ad_emp_id != emp_id: changes['employeeID'] = [(MODIFY_REPLACE, [emp_id])]
@@ -337,43 +410,43 @@ def main_loop():
             if ad_dept != department: changes['department'] = [(MODIFY_REPLACE, [department])]
             if ad_title != job_title: changes['title'] = [(MODIFY_REPLACE, [job_title])]
             if ad_fa_name != fa_display_name: changes['faDisplayName'] = [(MODIFY_REPLACE, [fa_display_name])]
+            if ad_company != company: changes['company'] = [(MODIFY_REPLACE, [company])]
             if ad_manager.lower() != manager_dn.lower():
                 changes['manager'] = [(MODIFY_REPLACE, [manager_dn])] if manager_dn else [(MODIFY_REPLACE, [])]
 
             if changes:
-                try:
-                    # اعمال تغییرات در AD
-                    for attr, mod in changes.items():
-                        ad_conn.modify(user_dn, {attr: mod[0]})
+                logger.info(f"Applying AD changes for {email}: {list(changes.keys())}")
+                ok = conn.modify(user_dn, changes)
+                if not ok:
+                    raise Exception(f"LDAP modify failed: {conn.result}")
 
-                    # ثبت در دیتابیس محلی
-                    pg_cursor.execute("""
-                        INSERT INTO sync_cache (email, employee_id, contract_type, cost_center_title, emp_mob, ext_attribute7, department, job_title, manager_dn, fa_display_name)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (email) DO UPDATE SET employee_id=EXCLUDED.employee_id, contract_type=EXCLUDED.contract_type, cost_center_title=EXCLUDED.cost_center_title, emp_mob=EXCLUDED.emp_mob, ext_attribute7=EXCLUDED.ext_attribute7, department=EXCLUDED.department, job_title=EXCLUDED.job_title, manager_dn=EXCLUDED.manager_dn, fa_display_name=EXCLUDED.fa_display_name
-                    """, (email, emp_id, contract_type, cost_center, emp_mob, ext_attr7, department, job_title, manager_dn, fa_display_name))
-                    pg_conn.commit()
+                updated_count += 1
+                change_info = f"Update: {email} | Fields: {list(changes.keys())}"
+                sync_status["changes_log"].insert(0, change_info)
+                if len(sync_status["changes_log"]) > 10:
+                    sync_status["changes_log"].pop()
+            else:
+                skipped_count += 1
 
-                    # ثبت تغییر موفق برای نمایش در داشبورد
-                    updated_count += 1
-                    change_info = f"Update: {email} | Fields: {list(changes.keys())}"
-                    sync_status["changes_log"].insert(0, change_info)
-                    if len(sync_status["changes_log"]) > 10: sync_status["changes_log"].pop()
-
-                except Exception as e:
-                    # ثبت خطا در لیست خطاهای داشبورد
-                    err_msg = f"Error {email}: {str(e)}"
-                    logger.error(err_msg)
-                    if len(sync_status["errors"]) < 10: sync_status["errors"].insert(0, err_msg)
+            # cache فقط بعد از validate واقعی AD و موفقیت modify/no-change نوشته میشود.
+            upsert_cache(
+                email, emp_id, contract_type, cost_center, emp_mob, ext_attr7,
+                department, job_title, manager_email, manager_dn, fa_display_name, company
+            )
 
         except Exception as e:
             err_msg = f"Failed to sync {emp.get('Email')}: {e}"
             logger.error(err_msg)
-            if len(sync_status["errors"]) < 10: sync_status["errors"].insert(0, err_msg)
+            if len(sync_status["errors"]) < 10:
+                sync_status["errors"].insert(0, err_msg)
 
-    pg_cursor.close()
-    pg_conn.close()
-    ad_conn.unbind()
+    try:
+        pg_cursor.close()
+        pg_conn.close()
+    finally:
+        if ad_conn is not None and ad_conn.bound:
+            ad_conn.unbind()
+
     logger.info(f"Sync complete. Updated: {updated_count}, Skipped: {skipped_count}")
     sync_status.update({
         "status": "Success",
@@ -396,15 +469,15 @@ def sleep_until_midnight():
 
 def sync_scheduler_thread():
     global sync_status
-    logger.info("Running an initial sync cycle...")
+    logger.info("Running initial sync cycle. RESET_SYNC_CACHE_ON_START=%s", RESET_SYNC_CACHE_ON_START)
     sync_status["status"] = "Running Initial Cycle"
-    main_loop()
+    main_loop(rebuild_cache=RESET_SYNC_CACHE_ON_START)
     while True:
         sync_status["status"] = "Waiting until midnight"
         sleep_until_midnight()
         logger.info("Midnight reached. Executing formal sync cycle...")
         sync_status["status"] = "Running Formal Sync Cycle"
-        main_loop()
+        main_loop(rebuild_cache=False)
         time.sleep(60)
 
 @app.route('/')
@@ -425,23 +498,9 @@ def health():
 
 @app.route('/webfonts/<path:filename>')
 def serve_webfonts(filename):
-    # هر درخواستی که به /webfonts/ بیاید، به /static/webfonts/ هدایت می‌شود
+    # هر درخواستی که به /webfonts/ بیاید، به /static/webfonts/ هدایت میشود
     return send_from_directory('static/webfonts', filename)
 
 if __name__ == "__main__":
     threading.Thread(target=sync_scheduler_thread, daemon=True).start()
     app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
-
-
------------------
-
-### 🔒 Security Protocol (`.gitignore`)
-
-To ensure organizational data and credentials are never pushed to GitHub, always use the following `.gitignore`:
-
-```text
-.env
-*.log
-__pycache__/
-*.db
-sync_data.json
