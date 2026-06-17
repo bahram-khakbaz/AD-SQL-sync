@@ -1,124 +1,239 @@
-This is the ultimate professional structure for your `README.md`. Since you have provided all the components, I have compiled them into a clean, industrial-grade documentation format that you can push directly to GitHub.
+# DigiExpress QuantumSync Monitor
+
+**DigiExpress QuantumSync Monitor** is a production-ready synchronization service between **Rahkaran SQL Server** and **Active Directory (LDAP)**. It reads employee data from Rahkaran, updates matching AD users, writes a local PostgreSQL sync cache, and exposes a real-time Flask monitoring dashboard.
+
+This version includes the production fixes validated during deployment:
+
+- Automatic AD `company` update with the exact value `Digi Express`.
+- Safer LDAP modify handling; failed AD writes are detected and logged.
+- Cache-first behavior after initial validation to avoid unnecessary AD load.
+- Optional manual cache rebuild using `RESET_SYNC_CACHE_ON_START`.
+- Correct Docker bind mount for `/app/main.py`, so code changes are actually loaded by the running container.
 
 ---
 
-# Company QuantumSync Monitor
+## Architecture
 
-**Company QuantumSync Monitor** is a high-performance synchronization engine designed to bridge **Rahkaran SQL Server** with **Active Directory (LDAP)**, featuring an immersive, futuristic real-time monitoring dashboard.
+```text
+Rahkaran SQL Server
+        |
+        v
+Python Sync Engine / Flask Monitor
+        |
+        +--> Active Directory via LDAP
+        |
+        +--> PostgreSQL sync_cache
+        |
+        +--> Web Dashboard :8080 / host port 80
+```
 
 ---
 
-## 🛠 Zero-to-Production Setup Guide
+## What this service syncs
 
-Follow these steps to deploy the infrastructure from scratch on a clean Linux (Debian/Ubuntu) server.
+| Rahkaran field | Active Directory attribute / usage |
+| --- | --- |
+| `EmailAddress` | Used to find AD user by `mail` or `userPrincipalName` |
+| `PerssonelCode` | `employeeID` |
+| `ContractType` | `contractType` |
+| `CostCenterDlTitle` | `costCenterDlTitle` |
+| `MobileNumber` | `empMob` |
+| `Fix_Var` | `extensionAttribute7` |
+| `DepartmentTitleLastLevel` | `department` |
+| `PostTitleLastLevel` | `title` |
+| `ReportToEmail` | Finds manager DN and updates `manager` |
+| `FirstName` + `LastName` | `faDisplayName` |
+| Fixed value | `company = your company` |
 
-### 1. System Update
+---
+
+## Production behavior
+
+### Company attribute
+
+Every synced AD user should have:
+
+```text
+company = Digi Express
+```
+
+The value is configurable:
+
+```env
+AD_COMPANY_VALUE=Digi Express
+```
+
+If the variable is missing, the application uses `your comany` by default.
+
+### Sync cache behavior
+
+The PostgreSQL table `sync_cache` is used to reduce unnecessary AD traffic.
+
+Normal flow:
+
+1. Fetch employees from Rahkaran.
+2. Normalize Rahkaran values.
+3. Compare normalized values with `sync_cache`.
+4. If nothing changed, skip the user without querying AD.
+5. If the user is new or changed, query AD, calculate AD changes, apply LDAP modifications, then update `sync_cache` only after success.
+
+### Manual cache rebuild
+
+Use this only when you intentionally want to validate all records against AD again:
+
+```env
+RESET_SYNC_CACHE_ON_START=true
+```
+
+After one successful rebuild, set it back to:
+
+```env
+RESET_SYNC_CACHE_ON_START=false
+```
+
+Do not keep it enabled permanently, because every container restart will truncate and rebuild `sync_cache`.
+
+---
+
+## Zero-to-production setup
+
+### 1. System update
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-
 ```
 
-### 2. Docker & Docker Compose Installation
+### 2. Install Docker and Docker Compose
 
 ```bash
-# Install prerequisites
 sudo apt install ca-certificates curl gnupg -y
 sudo install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-# Install Docker
-sudo apt update && sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
-
+sudo apt update
+sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
 ```
 
-### 3. Project Directory & Permissions
+### 3. Create project directory
 
 ```bash
-# Create directory structure
-mkdir -p /opt/digiexpress-sync
 mkdir -p /opt/digiexpress-sync/static
 cd /opt/digiexpress-sync
-
-cd /opt/digiexpress-sync/static
-curl -L -o Orbitron-Regular.ttf https://github.com/google/fonts/raw/main/ofl/orbitron/Orbitron-Regular.ttf
-curl -L -o Vazirmatn-Regular.woff2 https://github.com/rastikerdar/vazirmatn/raw/master/fonts/webfonts/Vazirmatn-Regular.woff2
-
-# Set permissions
 chmod -R 755 /opt/digiexpress-sync
-chmod -R 755 /opt/digiexpress-sync/static
 ```
 
-### 4. Deployment
+### 4. Static files
 
-Once you have placed your files (`main.py`, `Dockerfile`, `docker-compose.yml`, `requirements.txt`, and fonts in `static/`) into the directory:
+Place dashboard static assets in:
 
-```bash
-docker-compose up -d --build
+```text
+/opt/digiexpress-sync/static
+```
 
+Required files include:
+
+```text
+bootstrap.rtl.min.css
+all.min.css
+Orbitron-Regular.ttf
+Vazirmatn-Regular.woff2
+static/webfonts/fa-solid-900.woff2
 ```
 
 ---
 
-## ⚙️ Configuration Files
+## docker-compose.yml
 
-### Dockerfile
-
-```dockerfile
-FROM mirror2.chabokan.net/library/python:3.11-slim
-RUN apt-get update && apt-get install -y unixodbc unixodbc-dev g++ curl gnupg2 \
-    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
-    && curl -fsSL https://packages.microsoft.com/config/debian/12/prod.list > /etc/apt/sources.list.d/mssql-release.list \
-    && apt-get update && ACCEPT_EULA=Y apt-get install -y msodbcsql18 \
-    && apt-get clean
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-CMD ["python", "main.py"]
-
-```
-
-### docker-compose.yml
+Use this version so local `main.py` is mounted directly into `/app/main.py`. This prevents the common issue where `/opt/digiexpress-sync/main.py` is edited on the host but the container still runs the old image copy.
 
 ```yaml
 version: '3.8'
+
 services:
   postgres-db:
     image: mirror2.chabokan.net/postgres:15-alpine
-    container_name: internal_db
+    container_name: digiexpress_internal_db
     environment:
-      - POSTGRES_USER=set user
-      - POSTGRES_PASSWORD=set password
-      - POSTGRES_DB=sync_storage
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: MySecretPostgresPass123
+      POSTGRES_DB: sync_storage
     volumes:
       - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d sync_storage"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: always
 
   sync-script:
     build: .
     container_name: rahkaran_ad_sync
+    depends_on:
+      postgres-db:
+        condition: service_healthy
     ports:
       - "80:8080"
     environment:
-      - PG_CONN_STR=postgresql://your user:your password@postgres-db:5432/sync_storage
-      - SQL_CONN_STR=DRIVER={ODBC Driver 18 for SQL Server};SERVER=Your IP Address;DATABASE=your database name;UID=user dabase;PWD=pass user;TrustServerCertificate=yes;
-      - LDAP_SERVER=ldap://Your LDAP SERVER:389
-      - LDAP_USER=Your Domain LDAP\USER Domain
-      - LDAP_PASSWORD=Your Pass user ldap
+      PG_CONN_STR: postgresql://admin:MySecretPostgresPass123@postgres-db:5432/sync_storage
+      SQL_CONN_STR: "DRIVER={ODBC Driver 18 for SQL Server};SERVER=YOUR_SQL_SERVER;DATABASE=YOUR_DATABASE;UID=YOUR_SQL_USER;PWD=YOUR_SQL_PASSWORD;TrustServerCertificate=yes;"
+      LDAP_SERVER: ldap://YOUR_DC:389
+      LDAP_USER: YOUR_DOMAIN\\YOUR_LDAP_USER
+      LDAP_PASSWORD: YOUR_LDAP_PASSWORD
+      AD_SEARCH_BASE: DC=digikala,DC=com
+      AD_COMPANY_VALUE: Digi Express
+      RESET_SYNC_CACHE_ON_START: "false"
     volumes:
-      - .:/opt/digiexpress-sync
+      - ./main.py:/app/main.py:ro
+      - ./static:/app/static:ro
     restart: always
 
 volumes:
   pgdata:
-
 ```
-### main.py
-```main.py
+
+> Replace all placeholder values before production deployment. Do not commit real passwords to GitHub.
+
+---
+
+## Dockerfile
+
+```dockerfile
+FROM mirror2.chabokan.net/library/python:3.11-slim
+
+RUN apt-get update && apt-get install -y unixodbc unixodbc-dev g++ curl gnupg2 \
+    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
+    && curl -fsSL https://packages.microsoft.com/config/debian/12/prod.list > /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update && ACCEPT_EULA=Y apt-get install -y msodbcsql18 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "main.py"]
+```
+
+---
+
+## requirements.txt
+
+```text
+Flask
+ldap3
+psycopg2-binary
+pyodbc
+```
+
+---
+
+## main.py
+
+```python
 import os
-import sys
 import logging
 import time
 import threading
@@ -126,6 +241,7 @@ from datetime import datetime, timedelta
 import psycopg2
 import pyodbc
 from ldap3 import Server, Connection, ALL, MODIFY_REPLACE
+from ldap3.utils.conv import escape_filter_chars
 from flask import Flask, jsonify, render_template_string, send_from_directory
 
 # --- تنظیمات لاگین برای مانیتورینگ در داکر ---
@@ -141,18 +257,19 @@ sync_status = {
     "skipped_count": 0,
     "next_sync_eta": "Calculating...",
     "errors": [],
-    "changes_log": [], # اضافه کردن لیست تغییرات اخیر
-    "errors": []       # لیست خطاها
+    "changes_log": []  # لیست تغییرات اخیر
 }
 
 # --- بارگذاری متغیرهای محیطی از داکرکومپوز ---
-PG_CONN_STR = os.getenv("PG_CONN_STR", "postgresql://your user:your password@postgres-db:5432/sync_storage")
+PG_CONN_STR = os.getenv("PG_CONN_STR", "postgresql://admin:MySecretPostgresPass123@postgres-db:5432/sync_storage")
 SQL_CONN_STR = os.getenv("SQL_CONN_STR")
 
-AD_SERVER = os.getenv("LDAP_SERVER", "ldap://Your Ldap Server")
+AD_SERVER = os.getenv("LDAP_SERVER", "ldap://DN2-DC01.digikala.com")
 AD_USER = os.getenv("LDAP_USER")
 AD_PASSWORD = os.getenv("LDAP_PASSWORD")
-AD_SEARCH_BASE = os.getenv("AD_SEARCH_BASE", "DC=your domain,DC=com")
+AD_SEARCH_BASE = os.getenv("AD_SEARCH_BASE", "DC=digikala,DC=com")
+COMPANY_VALUE = os.getenv("AD_COMPANY_VALUE", "Digi Express")
+RESET_SYNC_CACHE_ON_START = os.getenv("RESET_SYNC_CACHE_ON_START", "false").strip().lower() in ("1", "true", "yes", "y")
 
 # --- قالب گرافیکی HTML داشبورد مانیتورینگ ---
 DASHBOARD_HTML = """
@@ -314,14 +431,16 @@ def get_rahkaran_data():
         raise e
 
 def find_ad_user_by_email(ad_conn, email):
-    search_filter = f"(|(mail={email})(userPrincipalName={email}))"
+    safe_email = escape_filter_chars(email)
+    search_filter = f"(|(mail={safe_email})(userPrincipalName={safe_email}))"
     ad_conn.search(
         search_base=AD_SEARCH_BASE,
         search_filter=search_filter,
         attributes=[
             'distinguishedName', 'employeeID', 'contractType',
             'costCenterDlTitle', 'empMob', 'extensionAttribute7',
-            'department', 'title', 'manager', 'faDisplayName'
+            'department', 'title', 'manager', 'faDisplayName',
+            'company'
         ]
     )
     if ad_conn.entries:
@@ -331,15 +450,28 @@ def find_ad_user_by_email(ad_conn, email):
 def find_ad_manager_dn_by_email(ad_conn, manager_email):
     if not manager_email:
         return None
-    search_filter = f"(|(mail={manager_email})(userPrincipalName={manager_email}))"
+    safe_email = escape_filter_chars(manager_email)
+    search_filter = f"(|(mail={safe_email})(userPrincipalName={safe_email}))"
     ad_conn.search(search_base=AD_SEARCH_BASE, search_filter=search_filter, attributes=['distinguishedName'])
     if ad_conn.entries:
         return str(ad_conn.entries[0].distinguishedName)
     return None
 
-def main_loop():
+def main_loop(rebuild_cache=False):
+    """
+    rebuild_cache=True:
+        - sync_cache را خالی می‌کند.
+        - برای همه رکوردهای راهکاران با AD چک می‌کند.
+        - اگر لازم بود AD را آپدیت می‌کند.
+        - بعد از موفقیت، cache را از نو می‌سازد.
+
+    rebuild_cache=False:
+        - اول فقط راهکاران را با sync_cache مقایسه می‌کند.
+        - اگر داده نسبت به cache تغییری نکرده باشد، اصلاً به AD وصل نمی‌شود.
+        - فقط برای رکوردهای جدید/تغییرکرده به AD وصل می‌شود و آپدیت می‌زند.
+    """
     global sync_status
-    logger.info("Starting synchronization cycle...")
+    logger.info("Starting synchronization cycle... rebuild_cache=%s", rebuild_cache)
 
     try:
         employees = get_rahkaran_data()
@@ -351,16 +483,6 @@ def main_loop():
     if not employees:
         logger.warning("No data found from Rahkaran. Skipping this cycle.")
         sync_status["status"] = "Skipped (No Data)"
-        return
-
-    try:
-        server = Server(AD_SERVER, get_info=ALL)
-        ad_conn = Connection(server, user=AD_USER, password=AD_PASSWORD, auto_bind=True)
-        logger.info("Connected successfully to Active Directory.")
-    except Exception as e:
-        logger.error(f"LDAP connection failed: {e}")
-        sync_status["status"] = "Failed (AD LDAP Connection Error)"
-        sync_status["errors"].append(f"AD Connection Error: {str(e)}")
         return
 
     try:
@@ -376,17 +498,80 @@ def main_loop():
                 ext_attribute7 VARCHAR(100),
                 department VARCHAR(255),
                 job_title VARCHAR(255),
+                manager_email VARCHAR(255),
                 manager_dn TEXT,
-                fa_display_name VARCHAR(255)
+                fa_display_name VARCHAR(255),
+                company VARCHAR(255)
             )
         """)
+        # برای سازگاری با جدول قبلی که manager_email نداشت
+        pg_cursor.execute("ALTER TABLE sync_cache ADD COLUMN IF NOT EXISTS manager_email VARCHAR(255)")
         pg_conn.commit()
+
+        if rebuild_cache:
+            logger.warning("Initial rebuild requested. Truncating sync_cache before AD validation...")
+            pg_cursor.execute("TRUNCATE TABLE sync_cache")
+            pg_conn.commit()
     except Exception as e:
         logger.error(f"PostgreSQL connection/init failed: {e}")
-        ad_conn.unbind()
         sync_status["status"] = "Failed (Local DB Cache Error)"
         sync_status["errors"].append(f"DB Error: {str(e)}")
         return
+
+    ad_conn = None
+
+    def ensure_ad_connection():
+        nonlocal ad_conn
+        if ad_conn is not None and ad_conn.bound:
+            return ad_conn
+        try:
+            server = Server(AD_SERVER, get_info=ALL)
+            ad_conn = Connection(server, user=AD_USER, password=AD_PASSWORD, auto_bind=True)
+            logger.info("Connected successfully to Active Directory.")
+            return ad_conn
+        except Exception as e:
+            logger.error(f"LDAP connection failed: {e}")
+            raise Exception(f"AD Connection Error: {str(e)}")
+
+    def get_ad_val_safe(user_obj, attr_name):
+        attr = getattr(user_obj, attr_name, None)
+        if attr is None:
+            return ""
+        if hasattr(attr, 'values') and attr.values:
+            return str(attr.values[0]).strip()
+        if hasattr(attr, 'value') and attr.value:
+            if isinstance(attr.value, list):
+                return str(attr.value[0]).strip()
+            return str(attr.value).strip()
+        val_str = str(attr).strip()
+        return "" if val_str.startswith('[') or val_str.endswith(']') else val_str
+
+    def upsert_cache(email, emp_id, contract_type, cost_center, emp_mob, ext_attr7,
+                     department, job_title, manager_email, manager_dn, fa_display_name, company):
+        pg_cursor.execute("""
+            INSERT INTO sync_cache (
+                email, employee_id, contract_type, cost_center_title, emp_mob,
+                ext_attribute7, department, job_title, manager_email, manager_dn,
+                fa_display_name, company
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (email) DO UPDATE SET
+                employee_id=EXCLUDED.employee_id,
+                contract_type=EXCLUDED.contract_type,
+                cost_center_title=EXCLUDED.cost_center_title,
+                emp_mob=EXCLUDED.emp_mob,
+                ext_attribute7=EXCLUDED.ext_attribute7,
+                department=EXCLUDED.department,
+                job_title=EXCLUDED.job_title,
+                manager_email=EXCLUDED.manager_email,
+                manager_dn=EXCLUDED.manager_dn,
+                fa_display_name=EXCLUDED.fa_display_name,
+                company=EXCLUDED.company
+        """, (
+            email, emp_id, contract_type, cost_center, emp_mob, ext_attr7,
+            department, job_title, manager_email, manager_dn, fa_display_name, company
+        ))
+        pg_conn.commit()
 
     updated_count = 0
     skipped_count = 0
@@ -405,37 +590,40 @@ def main_loop():
             first_name = emp['FirstName'].strip() if emp['FirstName'] else ""
             last_name = emp['LastName'].strip() if emp['LastName'] else ""
             fa_display_name = f"{first_name} {last_name}".strip()
+            company = COMPANY_VALUE
 
-            ad_user = find_ad_user_by_email(ad_conn, email)
+            # در سیکل‌های عادی، اول با cache مقایسه می‌کنیم تا بی‌دلیل به AD فشار نیاید.
+            # manager_dn را اینجا مقایسه نمی‌کنیم چون برای ساختنش باید AD سرچ شود؛ manager_email را cache کرده‌ایم.
+            if not rebuild_cache:
+                pg_cursor.execute("""
+                    SELECT employee_id, contract_type, cost_center_title, emp_mob,
+                           ext_attribute7, department, job_title, manager_email,
+                           fa_display_name, company
+                    FROM sync_cache
+                    WHERE email = %s
+                """, (email,))
+                cached = pg_cursor.fetchone()
+
+                current_signature = (
+                    emp_id, contract_type, cost_center, emp_mob, ext_attr7,
+                    department, job_title, manager_email, fa_display_name, company
+                )
+
+                if cached and tuple("" if v is None else str(v) for v in cached) == current_signature:
+                    skipped_count += 1
+                    continue
+
+            conn = ensure_ad_connection()
+            ad_user = find_ad_user_by_email(conn, email)
             if not ad_user:
                 skipped_count += 1
+                logger.warning("AD user not found for email: %s", email)
                 continue
 
             user_dn = str(ad_user.distinguishedName)
             manager_dn = ""
             if manager_email:
-                manager_dn = find_ad_manager_dn_by_email(ad_conn, manager_email) or ""
-
-            pg_cursor.execute("SELECT employee_id, contract_type, cost_center_title, emp_mob, ext_attribute7, department, job_title, manager_dn, fa_display_name FROM sync_cache WHERE email = %s", (email,))
-            cached = pg_cursor.fetchone()
-
-            has_changes = False
-            if not cached or (cached[0] != emp_id or cached[1] != contract_type or cached[2] != cost_center or cached[3] != emp_mob or cached[4] != ext_attr7 or cached[5] != department or cached[6] != job_title or cached[7] != manager_dn or cached[8] != fa_display_name):
-                has_changes = True
-
-            if not has_changes:
-                skipped_count += 1
-                continue
-
-            def get_ad_val_safe(user_obj, attr_name):
-                attr = getattr(user_obj, attr_name, None)
-                if attr is None: return ""
-                if hasattr(attr, 'values') and attr.values: return str(attr.values[0]).strip()
-                if hasattr(attr, 'value') and attr.value:
-                    if isinstance(attr.value, list): return str(attr.value[0]).strip()
-                    return str(attr.value).strip()
-                val_str = str(attr).strip()
-                return "" if val_str.startswith('[') or val_str.endswith(']') else val_str
+                manager_dn = find_ad_manager_dn_by_email(conn, manager_email) or ""
 
             ad_emp_id = get_ad_val_safe(ad_user, 'employeeID')
             ad_contract = get_ad_val_safe(ad_user, 'contractType')
@@ -446,6 +634,7 @@ def main_loop():
             ad_title = get_ad_val_safe(ad_user, 'title')
             ad_fa_name = get_ad_val_safe(ad_user, 'faDisplayName')
             ad_manager = get_ad_val_safe(ad_user, 'manager')
+            ad_company = get_ad_val_safe(ad_user, 'company')
 
             changes = {}
             if ad_emp_id != emp_id: changes['employeeID'] = [(MODIFY_REPLACE, [emp_id])]
@@ -456,43 +645,43 @@ def main_loop():
             if ad_dept != department: changes['department'] = [(MODIFY_REPLACE, [department])]
             if ad_title != job_title: changes['title'] = [(MODIFY_REPLACE, [job_title])]
             if ad_fa_name != fa_display_name: changes['faDisplayName'] = [(MODIFY_REPLACE, [fa_display_name])]
+            if ad_company != company: changes['company'] = [(MODIFY_REPLACE, [company])]
             if ad_manager.lower() != manager_dn.lower():
                 changes['manager'] = [(MODIFY_REPLACE, [manager_dn])] if manager_dn else [(MODIFY_REPLACE, [])]
 
             if changes:
-                try:
-                    # اعمال تغییرات در AD
-                    for attr, mod in changes.items():
-                        ad_conn.modify(user_dn, {attr: mod[0]})
+                logger.info(f"Applying AD changes for {email}: {list(changes.keys())}")
+                ok = conn.modify(user_dn, changes)
+                if not ok:
+                    raise Exception(f"LDAP modify failed: {conn.result}")
 
-                    # ثبت در دیتابیس محلی
-                    pg_cursor.execute("""
-                        INSERT INTO sync_cache (email, employee_id, contract_type, cost_center_title, emp_mob, ext_attribute7, department, job_title, manager_dn, fa_display_name)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (email) DO UPDATE SET employee_id=EXCLUDED.employee_id, contract_type=EXCLUDED.contract_type, cost_center_title=EXCLUDED.cost_center_title, emp_mob=EXCLUDED.emp_mob, ext_attribute7=EXCLUDED.ext_attribute7, department=EXCLUDED.department, job_title=EXCLUDED.job_title, manager_dn=EXCLUDED.manager_dn, fa_display_name=EXCLUDED.fa_display_name
-                    """, (email, emp_id, contract_type, cost_center, emp_mob, ext_attr7, department, job_title, manager_dn, fa_display_name))
-                    pg_conn.commit()
+                updated_count += 1
+                change_info = f"Update: {email} | Fields: {list(changes.keys())}"
+                sync_status["changes_log"].insert(0, change_info)
+                if len(sync_status["changes_log"]) > 10:
+                    sync_status["changes_log"].pop()
+            else:
+                skipped_count += 1
 
-                    # ثبت تغییر موفق برای نمایش در داشبورد
-                    updated_count += 1
-                    change_info = f"Update: {email} | Fields: {list(changes.keys())}"
-                    sync_status["changes_log"].insert(0, change_info)
-                    if len(sync_status["changes_log"]) > 10: sync_status["changes_log"].pop()
-
-                except Exception as e:
-                    # ثبت خطا در لیست خطاهای داشبورد
-                    err_msg = f"Error {email}: {str(e)}"
-                    logger.error(err_msg)
-                    if len(sync_status["errors"]) < 10: sync_status["errors"].insert(0, err_msg)
+            # cache فقط بعد از validate واقعی AD و موفقیت modify/no-change نوشته می‌شود.
+            upsert_cache(
+                email, emp_id, contract_type, cost_center, emp_mob, ext_attr7,
+                department, job_title, manager_email, manager_dn, fa_display_name, company
+            )
 
         except Exception as e:
             err_msg = f"Failed to sync {emp.get('Email')}: {e}"
             logger.error(err_msg)
-            if len(sync_status["errors"]) < 10: sync_status["errors"].insert(0, err_msg)
+            if len(sync_status["errors"]) < 10:
+                sync_status["errors"].insert(0, err_msg)
 
-    pg_cursor.close()
-    pg_conn.close()
-    ad_conn.unbind()
+    try:
+        pg_cursor.close()
+        pg_conn.close()
+    finally:
+        if ad_conn is not None and ad_conn.bound:
+            ad_conn.unbind()
+
     logger.info(f"Sync complete. Updated: {updated_count}, Skipped: {skipped_count}")
     sync_status.update({
         "status": "Success",
@@ -515,15 +704,15 @@ def sleep_until_midnight():
 
 def sync_scheduler_thread():
     global sync_status
-    logger.info("Running an initial sync cycle...")
+    logger.info("Running initial sync cycle. RESET_SYNC_CACHE_ON_START=%s", RESET_SYNC_CACHE_ON_START)
     sync_status["status"] = "Running Initial Cycle"
-    main_loop()
+    main_loop(rebuild_cache=RESET_SYNC_CACHE_ON_START)
     while True:
         sync_status["status"] = "Waiting until midnight"
         sleep_until_midnight()
         logger.info("Midnight reached. Executing formal sync cycle...")
         sync_status["status"] = "Running Formal Sync Cycle"
-        main_loop()
+        main_loop(rebuild_cache=False)
         time.sleep(60)
 
 @app.route('/')
@@ -550,46 +739,212 @@ def serve_webfonts(filename):
 if __name__ == "__main__":
     threading.Thread(target=sync_scheduler_thread, daemon=True).start()
     app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+```
 
+---
 
------------------
-
-### 🔒 Security Protocol (`.gitignore`)
-
-To ensure organizational data and credentials are never pushed to GitHub, always use the following `.gitignore`:
+## .gitignore
 
 ```text
 .env
 *.log
 __pycache__/
+*.pyc
 *.db
 sync_data.json
-
+.env.*
+!.env.example
 ```
 
 ---
 
-## 🔍 Troubleshooting
+## Deployment
 
-| Issue | Potential Cause | Fix |
-| --- | --- | --- |
-| **404 Font Errors** | Missing static files | Verify `Orbitron-Regular.ttf` exists in `/static/`. |
-| **Container Fails** | DB not ready | Check `docker logs rahkaran_ad_sync` for connection issues. |
-| **UI Glitches** | Browser Cache | Perform a hard refresh (`Ctrl + F5`). |
+### Build deployment
 
----
-
-### Next Step
-
-You are ready to initialize your local repository and push this to your GitHub account:
+Use this when the server has access to all required images and packages:
 
 ```bash
-git init
-git add .
-git commit -m "Initial commit: Production deployment configuration"
-# Add your remote origin here
-git push -u origin main
-
+cd /opt/digiexpress-sync
+docker compose up -d --build
+docker logs -f rahkaran_ad_sync
 ```
 
-Do you need any assistance with the specific `git remote add` command, or is everything clear to proceed with the push?
+### Update Python code without internet
+
+If the image already exists and you changed only `main.py`, either restart the service when using the recommended bind mount:
+
+```bash
+cd /opt/digiexpress-sync
+docker restart rahkaran_ad_sync
+docker logs -f rahkaran_ad_sync
+```
+
+Or copy the file directly into the running container:
+
+```bash
+docker cp /opt/digiexpress-sync/main.py rahkaran_ad_sync:/app/main.py
+docker restart rahkaran_ad_sync
+docker logs -f rahkaran_ad_sync
+```
+
+Verify the running container has the correct code:
+
+```bash
+docker exec rahkaran_ad_sync sh -lc "grep -n "Digi Express\|company\|RESET_SYNC_CACHE" /app/main.py | head -80"
+```
+
+Expected output should include:
+
+```text
+COMPANY_VALUE = os.getenv("AD_COMPANY_VALUE", "Digi Express")
+```
+
+---
+
+## Manual cache rebuild procedure
+
+1. Set in compose or environment:
+
+```env
+RESET_SYNC_CACHE_ON_START=true
+```
+
+2. Restart:
+
+```bash
+docker restart rahkaran_ad_sync
+```
+
+3. Watch logs:
+
+```bash
+docker logs -f rahkaran_ad_sync
+```
+
+4. After successful sync, set back:
+
+```env
+RESET_SYNC_CACHE_ON_START=false
+```
+
+5. Restart again:
+
+```bash
+docker restart rahkaran_ad_sync
+```
+
+---
+
+## Useful PostgreSQL checks
+
+Open psql:
+
+```bash
+docker exec -it digiexpress_internal_db psql -U admin -d sync_storage
+```
+
+Count cache rows:
+
+```sql
+SELECT COUNT(*) FROM sync_cache;
+```
+
+Check a user:
+
+```sql
+SELECT email, company
+FROM sync_cache
+WHERE email = 'vahid.khazaei@digikala.com';
+```
+
+Delete one user from cache for a targeted retest:
+
+```sql
+DELETE FROM sync_cache
+WHERE email = 'vahid.khazaei@digikala.com';
+```
+
+Do not truncate the full table unless you intentionally want a full AD revalidation.
+
+---
+
+## Useful AD checks
+
+Check the `company` attribute in Active Directory:
+
+```powershell
+Get-ADUser -LDAPFilter "(|(mail=vahid.khazaei@digikala.com)(userPrincipalName=vahid.khazaei@digikala.com))" -Properties company |
+Select Name,SamAccountName,Company
+```
+
+Search by mail or UPN:
+
+```powershell
+Get-ADUser -LDAPFilter "(|(mail=user@domain.com)(userPrincipalName=user@domain.com))" -Properties mail,userPrincipalName,company |
+Select Name,SamAccountName,mail,userPrincipalName,company
+```
+
+---
+
+## Log examples
+
+Successful company update:
+
+```text
+Applying AD changes for vahid.khazaei@digikala.com: ['company']
+Sync complete. Updated: 413, Skipped: 2106
+```
+
+AD user not found:
+
+```text
+AD user not found for email: user@domain.com
+```
+
+LDAP permission or object-level issue:
+
+```text
+LDAP modify failed: {'result': 50, 'description': 'insufficientAccessRights'}
+```
+
+This can happen for stale/disabled/moved AD users, users whose email was removed, or attributes delegated differently across OUs.
+
+---
+
+## Troubleshooting
+
+| Issue | Cause | Fix |
+| --- | --- | --- |
+| `company` does not update | Container still runs old `/app/main.py` | Run `docker exec ... grep` and use bind mount or `docker cp` |
+| `company` is in cache but not AD | Old code updated cache without checking LDAP result | Use this version; delete one row from cache and retest |
+| Lots of `AD user not found` | AD user has no `mail`/`userPrincipalName`, or user left organization | Expected for stale users; verify AD object if needed |
+| `insufficientAccessRights` | LDAP account cannot write that object/attribute, or object is stale/moved | Check OU delegation and object status |
+| Dashboard static 404 | Missing local static assets | Verify files in `/opt/digiexpress-sync/static` |
+| Code changed but behavior did not | No bind mount and no rebuild/copy | Use `docker cp main.py rahkaran_ad_sync:/app/main.py` then restart |
+
+---
+
+## Git workflow
+
+```bash
+cd /opt/digiexpress-sync
+git status
+git add README.md main.py Dockerfile docker-compose.yml requirements.txt .gitignore
+git commit -m "Update AD sync cache logic and company attribute handling"
+git push
+```
+
+---
+
+## Security notes
+
+Never commit real values for:
+
+- SQL username/password
+- LDAP username/password
+- production server IPs if internal policy forbids it
+- `.env` files
+- logs containing employee data
+
+Use environment variables or a protected `.env` file on the server.
