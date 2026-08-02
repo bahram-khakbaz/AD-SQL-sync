@@ -26,7 +26,7 @@ sync_status = {
 }
 
 # --- بارگذاری متغیرهای محیطی از داکرکومپوز ---
-PG_CONN_STR = os.getenv("PG_CONN_STR", "postgresql://admin:MySecretPostgresPass123@postgres-db:5432/sync_storage")
+PG_CONN_STR = os.getenv("PG_CONN_STR")
 SQL_CONN_STR = os.getenv("SQL_CONN_STR")
 
 AD_SERVER = os.getenv("LDAP_SERVER", "ldap://DN2-DC01.digikala.com")
