@@ -1,4 +1,3 @@
-version: '3.8'
 services:
   postgres-db:
     image: mirror2.chabokan.net/postgres:15-alpine
@@ -17,6 +16,8 @@ services:
     ports:
       - "80:8080"
     environment:
+      - TZ=Asia/Tehran
+      - WEEKLY_REBUILD_WEEKDAY=4
       - PG_CONN_STR=postgresql://your user:your password@postgres-db:5432/sync_storage
       - SQL_CONN_STR=DRIVER={ODBC Driver 18 for SQL Server};SERVER=Your IP Address;DATABASE=your database name;UID=user dabase;PWD=pass user;TrustServerCertificate=yes;
       - LDAP_SERVER=ldap://Your LDAP SERVER:389
@@ -24,6 +25,8 @@ services:
       - LDAP_PASSWORD=Your Pass user ldap
     volumes:
       - .:/opt/digiexpress-sync
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     restart: always
 
 volumes:
