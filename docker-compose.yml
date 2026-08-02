@@ -3,9 +3,9 @@ services:
     image: mirror2.chabokan.net/postgres:15-alpine
     container_name: internal_db
     environment:
-      - POSTGRES_USER=set user
-      - POSTGRES_PASSWORD=set password
-      - POSTGRES_DB=sync_storage
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-sync_storage}
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: always
@@ -18,11 +18,13 @@ services:
     environment:
       - TZ=Asia/Tehran
       - WEEKLY_REBUILD_WEEKDAY=4
-      - PG_CONN_STR=postgresql://your user:your password@postgres-db:5432/sync_storage
-      - SQL_CONN_STR=DRIVER={ODBC Driver 18 for SQL Server};SERVER=Your IP Address;DATABASE=your database name;UID=user dabase;PWD=pass user;TrustServerCertificate=yes;
-      - LDAP_SERVER=ldap://Your LDAP SERVER:389
-      - LDAP_USER=Your Domain LDAP\USER Domain
-      - LDAP_PASSWORD=Your Pass user ldap
+      - PG_CONN_STR=${PG_CONN_STR}
+      - SQL_CONN_STR=${SQL_CONN_STR}
+      - LDAP_SERVER=${LDAP_SERVER}
+      - LDAP_USER=${LDAP_USER}
+      - LDAP_PASSWORD=${LDAP_PASSWORD}
+      - AD_SEARCH_BASE=${AD_SEARCH_BASE}
+      - AD_COMPANY_VALUE=${AD_COMPANY_VALUE:-Digi Express}
     volumes:
       - .:/opt/digiexpress-sync
       - /etc/localtime:/etc/localtime:ro
