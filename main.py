@@ -26,7 +26,7 @@ sync_status = {
 }
 
 # --- بارگذاری متغیرهای محیطی از داکرکومپوز ---
-PG_CONN_STR = os.getenv("PG_CONN_STR", "postgresql://admin:MySecretPostgresPass123@postgres-db:5432/sync_storage")
+PG_CONN_STR = os.getenv("PG_CONN_STR")
 SQL_CONN_STR = os.getenv("SQL_CONN_STR")
 
 AD_SERVER = os.getenv("LDAP_SERVER", "ldap://DN2-DC01.digikala.com")
@@ -34,7 +34,6 @@ AD_USER = os.getenv("LDAP_USER")
 AD_PASSWORD = os.getenv("LDAP_PASSWORD")
 AD_SEARCH_BASE = os.getenv("AD_SEARCH_BASE", "DC=digikala,DC=com")
 COMPANY_VALUE = os.getenv("AD_COMPANY_VALUE", "Digi Express")
-RESET_SYNC_CACHE_ON_START = os.getenv("RESET_SYNC_CACHE_ON_START", "false").strip().lower() in ("1", "true", "yes", "y")
 
 # --- قالب گرافیکی HTML داشبورد مانیتورینگ ---
 DASHBOARD_HTML = """
@@ -457,28 +456,66 @@ def main_loop(rebuild_cache=False):
 
 def sleep_until_midnight():
     global sync_status
+
     while True:
         now = datetime.now()
-        tomorrow_midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
-        seconds_to_wait = (tomorrow_midnight - now).total_seconds()
+        next_midnight = datetime.combine(
+            now.date() + timedelta(days=1),
+            datetime.min.time()
+        )
+        seconds_to_wait = (next_midnight - now).total_seconds()
+
+        if seconds_to_wait <= 0:
+            break
+
         hours = int(seconds_to_wait // 3600)
         minutes = int((seconds_to_wait % 3600) // 60)
         sync_status["next_sync_eta"] = f"{hours}h {minutes}m"
-        if seconds_to_wait <= 60: break
-        time.sleep(60)
+
+        # Wait until the actual midnight, including the final minute.
+        time.sleep(min(60, max(1, seconds_to_wait)))
+
 
 def sync_scheduler_thread():
     global sync_status
-    logger.info("Running initial sync cycle. RESET_SYNC_CACHE_ON_START=%s", RESET_SYNC_CACHE_ON_START)
-    sync_status["status"] = "Running Initial Cycle"
-    main_loop(rebuild_cache=RESET_SYNC_CACHE_ON_START)
+
+    # Python weekday: Monday=0 ... Friday=4 ... Sunday=6
+    weekly_rebuild_weekday = int(
+        os.getenv("WEEKLY_REBUILD_WEEKDAY", "4")
+    )
+
+    logger.info("Running startup full rebuild cycle...")
+    sync_status["status"] = "Running Startup Full Rebuild"
+
+    # Every container startup intentionally rebuilds the complete cache.
+    main_loop(rebuild_cache=True)
+
     while True:
         sync_status["status"] = "Waiting until midnight"
         sleep_until_midnight()
-        logger.info("Midnight reached. Executing formal sync cycle...")
-        sync_status["status"] = "Running Formal Sync Cycle"
-        main_loop(rebuild_cache=False)
+
+        now = datetime.now()
+        run_weekly_rebuild = now.weekday() == weekly_rebuild_weekday
+
+        if run_weekly_rebuild:
+            logger.info(
+                "Weekly full cache rebuild started. weekday=%s",
+                now.weekday()
+            )
+            sync_status["status"] = "Running Weekly Full Rebuild"
+        else:
+            logger.info(
+                "Daily incremental synchronization started. weekday=%s",
+                now.weekday()
+            )
+            sync_status["status"] = "Running Daily Incremental Sync"
+
+        # Full rebuild on the configured weekday; incremental on other days.
+        main_loop(rebuild_cache=run_weekly_rebuild)
+
+        # Prevent a duplicate execution during the same midnight window.
         time.sleep(60)
+
 
 @app.route('/')
 def get_status():
