@@ -7,7 +7,7 @@ This version includes the production fixes validated during deployment:
 - Automatic AD `company` update with the exact value `Digi Express`.
 - Safer LDAP modify handling; failed AD writes are detected and logged.
 - Cache-first behavior after initial validation to avoid unnecessary AD load.
-- Optional manual cache rebuild using `RESET_SYNC_CACHE_ON_START`.
+- Full cache rebuild on every container startup plus a configurable weekly rebuild.
 - Correct Docker bind mount for `/app/main.py`, so code changes are actually loaded by the running container.
 
 ---
@@ -77,21 +77,23 @@ Normal flow:
 4. If nothing changed, skip the user without querying AD.
 5. If the user is new or changed, query AD, calculate AD changes, apply LDAP modifications, then update `sync_cache` only after success.
 
-### Manual cache rebuild
+### Cache rebuild schedule
 
-Use this only when you intentionally want to validate all records against AD again:
+The scheduler uses Tehran local time and follows this policy:
+
+- Every container startup: full rebuild using `main_loop(rebuild_cache=True)`.
+- Every normal midnight: incremental synchronization.
+- Every Friday at midnight by default: full cache rebuild.
+- Failed LDAP updates are not written to `sync_cache` and are retried later.
+
+The weekly rebuild day uses Python weekday numbering:
 
 ```env
-RESET_SYNC_CACHE_ON_START=true
+TZ=Asia/Tehran
+WEEKLY_REBUILD_WEEKDAY=4
 ```
 
-After one successful rebuild, set it back to:
-
-```env
-RESET_SYNC_CACHE_ON_START=false
-```
-
-Do not keep it enabled permanently, because every container restart will truncate and rebuild `sync_cache`.
+`4` is Friday. Valid values are `0` for Monday through `6` for Sunday.
 
 ---
 
@@ -154,9 +156,9 @@ services:
     image: mirror2.chabokan.net/postgres:15-alpine
     container_name: digiexpress_internal_db
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: MySecretPostgresPass123
-      POSTGRES_DB: sync_storage
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-sync_storage}
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
@@ -177,17 +179,20 @@ services:
     ports:
       - "80:8080"
     environment:
-      PG_CONN_STR: postgresql://admin:MySecretPostgresPass123@postgres-db:5432/sync_storage
-      SQL_CONN_STR: "DRIVER={ODBC Driver 18 for SQL Server};SERVER=YOUR_SQL_SERVER;DATABASE=YOUR_DATABASE;UID=YOUR_SQL_USER;PWD=YOUR_SQL_PASSWORD;TrustServerCertificate=yes;"
-      LDAP_SERVER: ldap://YOUR_DC:389
-      LDAP_USER: YOUR_DOMAIN\\YOUR_LDAP_USER
-      LDAP_PASSWORD: YOUR_LDAP_PASSWORD
-      AD_SEARCH_BASE: DC=digikala,DC=com
-      AD_COMPANY_VALUE: Digi Express
-      RESET_SYNC_CACHE_ON_START: "false"
+      PG_CONN_STR: ${PG_CONN_STR}
+      SQL_CONN_STR: ${SQL_CONN_STR}
+      LDAP_SERVER: ${LDAP_SERVER}
+      LDAP_USER: ${LDAP_USER}
+      LDAP_PASSWORD: ${LDAP_PASSWORD}
+      AD_SEARCH_BASE: ${AD_SEARCH_BASE}
+      AD_COMPANY_VALUE: ${AD_COMPANY_VALUE:-Digi Express}
+      TZ: Asia/Tehran
+      WEEKLY_REBUILD_WEEKDAY: "4"
     volumes:
       - ./main.py:/app/main.py:ro
       - ./static:/app/static:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     restart: always
 
 volumes:
@@ -261,7 +266,7 @@ sync_status = {
 }
 
 # --- بارگذاری متغیرهای محیطی از داکرکومپوز ---
-PG_CONN_STR = os.getenv("PG_CONN_STR", "postgresql://admin:MySecretPostgresPass123@postgres-db:5432/sync_storage")
+PG_CONN_STR = os.getenv("PG_CONN_STR")
 SQL_CONN_STR = os.getenv("SQL_CONN_STR")
 
 AD_SERVER = os.getenv("LDAP_SERVER", "ldap://DN2-DC01.digikala.com")
@@ -269,7 +274,6 @@ AD_USER = os.getenv("LDAP_USER")
 AD_PASSWORD = os.getenv("LDAP_PASSWORD")
 AD_SEARCH_BASE = os.getenv("AD_SEARCH_BASE", "DC=digikala,DC=com")
 COMPANY_VALUE = os.getenv("AD_COMPANY_VALUE", "Digi Express")
-RESET_SYNC_CACHE_ON_START = os.getenv("RESET_SYNC_CACHE_ON_START", "false").strip().lower() in ("1", "true", "yes", "y")
 
 # --- قالب گرافیکی HTML داشبورد مانیتورینگ ---
 DASHBOARD_HTML = """
@@ -692,28 +696,66 @@ def main_loop(rebuild_cache=False):
 
 def sleep_until_midnight():
     global sync_status
+
     while True:
         now = datetime.now()
-        tomorrow_midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
-        seconds_to_wait = (tomorrow_midnight - now).total_seconds()
+        next_midnight = datetime.combine(
+            now.date() + timedelta(days=1),
+            datetime.min.time()
+        )
+        seconds_to_wait = (next_midnight - now).total_seconds()
+
+        if seconds_to_wait <= 0:
+            break
+
         hours = int(seconds_to_wait // 3600)
         minutes = int((seconds_to_wait % 3600) // 60)
         sync_status["next_sync_eta"] = f"{hours}h {minutes}m"
-        if seconds_to_wait <= 60: break
-        time.sleep(60)
+
+        # Wait until the actual midnight, including the final minute.
+        time.sleep(min(60, max(1, seconds_to_wait)))
+
 
 def sync_scheduler_thread():
     global sync_status
-    logger.info("Running initial sync cycle. RESET_SYNC_CACHE_ON_START=%s", RESET_SYNC_CACHE_ON_START)
-    sync_status["status"] = "Running Initial Cycle"
-    main_loop(rebuild_cache=RESET_SYNC_CACHE_ON_START)
+
+    # Python weekday: Monday=0 ... Friday=4 ... Sunday=6
+    weekly_rebuild_weekday = int(
+        os.getenv("WEEKLY_REBUILD_WEEKDAY", "4")
+    )
+
+    logger.info("Running startup full rebuild cycle...")
+    sync_status["status"] = "Running Startup Full Rebuild"
+
+    # Every container startup intentionally rebuilds the complete cache.
+    main_loop(rebuild_cache=True)
+
     while True:
         sync_status["status"] = "Waiting until midnight"
         sleep_until_midnight()
-        logger.info("Midnight reached. Executing formal sync cycle...")
-        sync_status["status"] = "Running Formal Sync Cycle"
-        main_loop(rebuild_cache=False)
+
+        now = datetime.now()
+        run_weekly_rebuild = now.weekday() == weekly_rebuild_weekday
+
+        if run_weekly_rebuild:
+            logger.info(
+                "Weekly full cache rebuild started. weekday=%s",
+                now.weekday()
+            )
+            sync_status["status"] = "Running Weekly Full Rebuild"
+        else:
+            logger.info(
+                "Daily incremental synchronization started. weekday=%s",
+                now.weekday()
+            )
+            sync_status["status"] = "Running Daily Incremental Sync"
+
+        # Full rebuild on the configured weekday; incremental on other days.
+        main_loop(rebuild_cache=run_weekly_rebuild)
+
+        # Prevent a duplicate execution during the same midnight window.
         time.sleep(60)
+
 
 @app.route('/')
 def get_status():
@@ -802,37 +844,29 @@ COMPANY_VALUE = os.getenv("AD_COMPANY_VALUE", "Digi Express")
 
 ---
 
-## Manual cache rebuild procedure
+## Manual full rebuild procedure
 
-1. Set in compose or environment:
+A full rebuild already runs automatically on every container startup and every configured weekly rebuild day.
 
-```env
-RESET_SYNC_CACHE_ON_START=true
-```
-
-2. Restart:
+To trigger an immediate full rebuild manually:
 
 ```bash
 docker restart rahkaran_ad_sync
 ```
 
-3. Watch logs:
+Watch the rebuild:
 
 ```bash
 docker logs -f rahkaran_ad_sync
 ```
 
-4. After successful sync, set back:
+Confirm the final cache count:
 
-```env
-RESET_SYNC_CACHE_ON_START=false
+```sql
+SELECT COUNT(*) FROM sync_cache;
 ```
 
-5. Restart again:
-
-```bash
-docker restart rahkaran_ad_sync
-```
+No temporary environment flag is required.
 
 ---
 

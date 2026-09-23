@@ -9,9 +9,11 @@ from ldap3 import Server, Connection, ALL, MODIFY_REPLACE
 from ldap3.utils.conv import escape_filter_chars
 from flask import Flask, jsonify, render_template_string, send_from_directory
 
+
 # --- تنظیمات لاگین برای مانیتورینگ در داکر ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
 
 # --- راهاندازی Flask برای مانیتورینگ آنلاین پنل وب ---
 app = Flask(__name__)
@@ -25,16 +27,18 @@ sync_status = {
     "changes_log": []  # لیست تغییرات اخیر
 }
 
+
 # --- بارگذاری متغیرهای محیطی از داکرکومپوز ---
-PG_CONN_STR = os.getenv("PG_CONN_STR", "postgresql://admin:MySecretPostgresPass123@postgres-db:5432/sync_storage")
+PG_CONN_STR = os.getenv("PG_CONN_STR")
 SQL_CONN_STR = os.getenv("SQL_CONN_STR")
+
 
 AD_SERVER = os.getenv("LDAP_SERVER", "ldap://DN2-DC01.digikala.com")
 AD_USER = os.getenv("LDAP_USER")
 AD_PASSWORD = os.getenv("LDAP_PASSWORD")
 AD_SEARCH_BASE = os.getenv("AD_SEARCH_BASE", "DC=digikala,DC=com")
 COMPANY_VALUE = os.getenv("AD_COMPANY_VALUE", "Digi Express")
-RESET_SYNC_CACHE_ON_START = os.getenv("RESET_SYNC_CACHE_ON_START", "false").strip().lower() in ("1", "true", "yes", "y")
+
 
 # --- قالب گرافیکی HTML داشبورد مانیتورینگ ---
 DASHBOARD_HTML = """
@@ -162,6 +166,7 @@ DASHBOARD_HTML = """
 </html>
 """
 
+
 def get_rahkaran_data():
     logger.info("Fetching active employee data from Rahkaran SQL Server...")
     query = """
@@ -195,6 +200,7 @@ def get_rahkaran_data():
         logger.error(f"Failed to fetch data from Rahkaran SQL Server: {e}")
         raise e
 
+
 def find_ad_user_by_email(ad_conn, email):
     safe_email = escape_filter_chars(email)
     search_filter = f"(|(mail={safe_email})(userPrincipalName={safe_email}))"
@@ -212,6 +218,7 @@ def find_ad_user_by_email(ad_conn, email):
         return ad_conn.entries[0]
     return None
 
+
 def find_ad_manager_dn_by_email(ad_conn, manager_email):
     if not manager_email:
         return None
@@ -221,6 +228,7 @@ def find_ad_manager_dn_by_email(ad_conn, manager_email):
     if ad_conn.entries:
         return str(ad_conn.entries[0].distinguishedName)
     return None
+
 
 def main_loop(rebuild_cache=False):
     """
@@ -238,6 +246,7 @@ def main_loop(rebuild_cache=False):
     global sync_status
     logger.info("Starting synchronization cycle... rebuild_cache=%s", rebuild_cache)
 
+
     try:
         employees = get_rahkaran_data()
     except Exception as e:
@@ -245,10 +254,12 @@ def main_loop(rebuild_cache=False):
         sync_status["errors"].append(f"Rahkaran Error: {str(e)}")
         return
 
+
     if not employees:
         logger.warning("No data found from Rahkaran. Skipping this cycle.")
         sync_status["status"] = "Skipped (No Data)"
         return
+
 
     try:
         pg_conn = psycopg2.connect(PG_CONN_STR)
@@ -273,6 +284,7 @@ def main_loop(rebuild_cache=False):
         pg_cursor.execute("ALTER TABLE sync_cache ADD COLUMN IF NOT EXISTS manager_email VARCHAR(255)")
         pg_conn.commit()
 
+
         if rebuild_cache:
             logger.warning("Initial rebuild requested. Truncating sync_cache before AD validation...")
             pg_cursor.execute("TRUNCATE TABLE sync_cache")
@@ -283,7 +295,9 @@ def main_loop(rebuild_cache=False):
         sync_status["errors"].append(f"DB Error: {str(e)}")
         return
 
+
     ad_conn = None
+
 
     def ensure_ad_connection():
         nonlocal ad_conn
@@ -298,6 +312,7 @@ def main_loop(rebuild_cache=False):
             logger.error(f"LDAP connection failed: {e}")
             raise Exception(f"AD Connection Error: {str(e)}")
 
+
     def get_ad_val_safe(user_obj, attr_name):
         attr = getattr(user_obj, attr_name, None)
         if attr is None:
@@ -310,6 +325,7 @@ def main_loop(rebuild_cache=False):
             return str(attr.value).strip()
         val_str = str(attr).strip()
         return "" if val_str.startswith('[') or val_str.endswith(']') else val_str
+
 
     def upsert_cache(email, emp_id, contract_type, cost_center, emp_mob, ext_attr7,
                      department, job_title, manager_email, manager_dn, fa_display_name, company):
@@ -338,8 +354,10 @@ def main_loop(rebuild_cache=False):
         ))
         pg_conn.commit()
 
+
     updated_count = 0
     skipped_count = 0
+
 
     for emp in employees:
         try:
@@ -357,6 +375,7 @@ def main_loop(rebuild_cache=False):
             fa_display_name = f"{first_name} {last_name}".strip()
             company = COMPANY_VALUE
 
+
             # در سیکلهای عادی، اول با cache مقایسه میکنیم تا بیدلیل به AD فشار نیاید.
             # manager_dn را اینجا مقایسه نمیکنیم چون برای ساختنش باید AD سرچ شود؛ manager_email را cache کردهایم.
             if not rebuild_cache:
@@ -369,14 +388,17 @@ def main_loop(rebuild_cache=False):
                 """, (email,))
                 cached = pg_cursor.fetchone()
 
+
                 current_signature = (
                     emp_id, contract_type, cost_center, emp_mob, ext_attr7,
                     department, job_title, manager_email, fa_display_name, company
                 )
 
+
                 if cached and tuple("" if v is None else str(v) for v in cached) == current_signature:
                     skipped_count += 1
                     continue
+
 
             conn = ensure_ad_connection()
             ad_user = find_ad_user_by_email(conn, email)
@@ -385,10 +407,12 @@ def main_loop(rebuild_cache=False):
                 logger.warning("AD user not found for email: %s", email)
                 continue
 
+
             user_dn = str(ad_user.distinguishedName)
             manager_dn = ""
             if manager_email:
                 manager_dn = find_ad_manager_dn_by_email(conn, manager_email) or ""
+
 
             ad_emp_id = get_ad_val_safe(ad_user, 'employeeID')
             ad_contract = get_ad_val_safe(ad_user, 'contractType')
@@ -400,6 +424,7 @@ def main_loop(rebuild_cache=False):
             ad_fa_name = get_ad_val_safe(ad_user, 'faDisplayName')
             ad_manager = get_ad_val_safe(ad_user, 'manager')
             ad_company = get_ad_val_safe(ad_user, 'company')
+
 
             changes = {}
             if ad_emp_id != emp_id: changes['employeeID'] = [(MODIFY_REPLACE, [emp_id])]
@@ -414,11 +439,13 @@ def main_loop(rebuild_cache=False):
             if ad_manager.lower() != manager_dn.lower():
                 changes['manager'] = [(MODIFY_REPLACE, [manager_dn])] if manager_dn else [(MODIFY_REPLACE, [])]
 
+
             if changes:
                 logger.info(f"Applying AD changes for {email}: {list(changes.keys())}")
                 ok = conn.modify(user_dn, changes)
                 if not ok:
                     raise Exception(f"LDAP modify failed: {conn.result}")
+
 
                 updated_count += 1
                 change_info = f"Update: {email} | Fields: {list(changes.keys())}"
@@ -428,11 +455,13 @@ def main_loop(rebuild_cache=False):
             else:
                 skipped_count += 1
 
+
             # cache فقط بعد از validate واقعی AD و موفقیت modify/no-change نوشته میشود.
             upsert_cache(
                 email, emp_id, contract_type, cost_center, emp_mob, ext_attr7,
                 department, job_title, manager_email, manager_dn, fa_display_name, company
             )
+
 
         except Exception as e:
             err_msg = f"Failed to sync {emp.get('Email')}: {e}"
@@ -440,12 +469,14 @@ def main_loop(rebuild_cache=False):
             if len(sync_status["errors"]) < 10:
                 sync_status["errors"].insert(0, err_msg)
 
+
     try:
         pg_cursor.close()
         pg_conn.close()
     finally:
         if ad_conn is not None and ad_conn.bound:
             ad_conn.unbind()
+
 
     logger.info(f"Sync complete. Updated: {updated_count}, Skipped: {skipped_count}")
     sync_status.update({
@@ -455,51 +486,109 @@ def main_loop(rebuild_cache=False):
         "skipped_count": skipped_count
     })
 
+
 def sleep_until_midnight():
     global sync_status
+
+    # Calculate the target once. Recalculating it after 00:00 would
+    # move the target to the following day and prevent the sync from running.
+    now = datetime.now()
+    next_midnight = datetime.combine(
+        now.date() + timedelta(days=1),
+        datetime.min.time()
+    )
+
     while True:
         now = datetime.now()
-        tomorrow_midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
-        seconds_to_wait = (tomorrow_midnight - now).total_seconds()
+        seconds_to_wait = (next_midnight - now).total_seconds()
+
+        if seconds_to_wait <= 0:
+            sync_status["next_sync_eta"] = "0h 0m"
+            return
+
         hours = int(seconds_to_wait // 3600)
         minutes = int((seconds_to_wait % 3600) // 60)
         sync_status["next_sync_eta"] = f"{hours}h {minutes}m"
-        if seconds_to_wait <= 60: break
-        time.sleep(60)
+
+        time.sleep(min(60, max(1, seconds_to_wait)))
+
 
 def sync_scheduler_thread():
     global sync_status
-    logger.info("Running initial sync cycle. RESET_SYNC_CACHE_ON_START=%s", RESET_SYNC_CACHE_ON_START)
-    sync_status["status"] = "Running Initial Cycle"
-    main_loop(rebuild_cache=RESET_SYNC_CACHE_ON_START)
+
+
+    # Python weekday: Monday=0 ... Friday=4 ... Sunday=6
+    weekly_rebuild_weekday = int(
+        os.getenv("WEEKLY_REBUILD_WEEKDAY", "4")
+    )
+
+
+    logger.info("Running startup full rebuild cycle...")
+    sync_status["status"] = "Running Startup Full Rebuild"
+
+
+    # Every container startup intentionally rebuilds the complete cache.
+    main_loop(rebuild_cache=True)
+
+
     while True:
         sync_status["status"] = "Waiting until midnight"
         sleep_until_midnight()
-        logger.info("Midnight reached. Executing formal sync cycle...")
-        sync_status["status"] = "Running Formal Sync Cycle"
-        main_loop(rebuild_cache=False)
+
+
+        now = datetime.now()
+        run_weekly_rebuild = now.weekday() == weekly_rebuild_weekday
+
+
+        if run_weekly_rebuild:
+            logger.info(
+                "Weekly full cache rebuild started. weekday=%s",
+                now.weekday()
+            )
+            sync_status["status"] = "Running Weekly Full Rebuild"
+        else:
+            logger.info(
+                "Daily incremental synchronization started. weekday=%s",
+                now.weekday()
+            )
+            sync_status["status"] = "Running Daily Incremental Sync"
+
+
+        # Full rebuild on the configured weekday; incremental on other days.
+        main_loop(rebuild_cache=run_weekly_rebuild)
+
+
+        # Prevent a duplicate execution during the same midnight window.
         time.sleep(60)
+
+
+
 
 @app.route('/')
 def get_status():
     return render_template_string(DASHBOARD_HTML, status_data=sync_status)
 
+
 @app.route('/static/<path:path>')
 def serve_static(path):
     return send_from_directory('static', path)
+
 
 @app.route('/api/json')
 def get_json_api():
     return jsonify(sync_status)
 
+
 @app.route('/health')
 def health():
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
 
 @app.route('/webfonts/<path:filename>')
 def serve_webfonts(filename):
     # هر درخواستی که به /webfonts/ بیاید، به /static/webfonts/ هدایت میشود
     return send_from_directory('static/webfonts', filename)
+
 
 if __name__ == "__main__":
     threading.Thread(target=sync_scheduler_thread, daemon=True).start()
